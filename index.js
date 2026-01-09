@@ -1,41 +1,26 @@
-const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 const cors = require('cors');
 const pino = require('pino');
 
-// --- CONFIGURATION ---
+// CONFIGURATION
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 3000;
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error("ERREUR CRITIQUE: Variables SUPABASE manquantes.");
-    process.exit(1);
-}
-
-console.log(`Connexion Supabase: ${SUPABASE_URL}`);
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app = express();
-
-const activeSessions = new Map();
 
 app.use(cors());
 app.use(express.json());
 
-// --- GESTION AUTH SUPABASE ---
+// GESTION AUTH SUPABASE
 const useSupabaseAuth = async (sessionId) => {
     const writeData = async (data, key) => {
         const { error } = await supabase
             .from('whatsapp_sessions')
-            .upsert({ 
-                session_id: sessionId, 
-                key_id: key, 
-                data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)),
-                updated_at: new Date().toISOString()
-            });
-        if (error) console.error('Erreur sauvegarde Auth:', error.message);
+            .upsert({ session_id: sessionId, key_id: key, data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) });
     };
 
     const readData = async (key) => {
@@ -86,186 +71,99 @@ const useSupabaseAuth = async (sessionId) => {
     };
 };
 
-// --- MOTEUR WHATSAPP ---
+// FONCTION PRINCIPALE
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`Demarrage session pour: ${instanceId}${phoneNumber ? ` (phone: ${phoneNumber})` : ' (QR mode)'}`);
+    console.log(`🚀 Démarrage session ${instanceId} (Phone: ${phoneNumber || 'QR Mode'})`);
     
-    // Éviter les sessions dupliquées
-    if (activeSessions.has(instanceId)) {
-        console.log(`Session ${instanceId} deja active, fermeture...`);
-        try {
-            activeSessions.get(instanceId).end();
-        } catch (e) {}
-        activeSessions.delete(instanceId);
-    }
+    try {
+        const { state, saveCreds } = await useSupabaseAuth(instanceId);
+        const { version } = await fetchLatestBaileysVersion();
 
-    const { state, saveCreds } = await useSupabaseAuth(instanceId);
-    const { version } = await fetchLatestBaileysVersion();
+        const sock = makeWASocket({
+            version,
+            auth: state,
+            logger: pino({ level: 'silent' }),
+            printQRInTerminal: true,
+            // 👇 OPTIMISATION CRITIQUE POUR RENDER GRATUIT 👇
+            browser: ["Ubuntu", "Chrome", "20.0.04"], // Identité Linux stable
+            syncFullHistory: false,                   // ⚠️ INDISPENSABLE : Empêche le crash mémoire
+            generateHighQualityLinkPreview: false,    // Économise le CPU
+            connectTimeoutMs: 60000,                  // Laisse le temps au serveur
+        });
 
-    const sock = makeWASocket({
-        version,
-        auth: state,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: !phoneNumber, // Désactiver si mode téléphone
-        browser: ["Ubuntu", "Chrome", "20.0.04"], // Anti-crash config
-        syncFullHistory: false, // Anti-crash: évite le téléchargement lourd
-        connectTimeoutMs: 60000,
-    });
+        // GESTION DU CODE DE JUMELAGE (PAIRING CODE)
+        if (phoneNumber && !sock.authState.creds.registered) {
+            console.log("⏳ Attente avant demande du code...");
+            setTimeout(async () => {
+                try {
+                    // Nettoyage du numéro
+                    const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
+                    console.log(`📞 Demande de code pour : ${cleanPhone}`);
+                    
+                    const code = await sock.requestPairingCode(cleanPhone);
+                    console.log(`🔑 CODE REÇU : ${code}`);
 
-    activeSessions.set(instanceId, sock);
+                    // Envoi direct dans Supabase
+                    const { error } = await supabase
+                        .from('instances')
+                        .update({ qr_code: code, status: 'pairing_code' })
+                        .eq('id', instanceId);
+                    
+                    if(error) console.error("Erreur écriture Supabase:", error);
 
-    // Variable pour tracker si on a déjà reçu un QR/code
-    let hasReceivedCode = false;
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        // MODE QR CODE
-        if (qr && !phoneNumber) {
-            console.log(`QR Code recu pour ${instanceId}!`);
-            hasReceivedCode = true;
-            const { error } = await supabase
-                .from('instances')
-                .update({ qr_code: qr, status: 'scanning' })
-                .eq('id', instanceId);
-            
-            if (error) {
-                console.error(`Erreur update QR:`, error.message);
-            } else {
-                console.log(`QR sauvegarde pour ${instanceId}`);
-            }
-        }
-
-        // MODE TÉLÉPHONE - Demander le pairing code
-        if (phoneNumber && !hasReceivedCode && connection !== 'open' && connection !== 'close') {
-            try {
-                console.log(`Demande de pairing code pour ${phoneNumber}...`);
-                
-                // Formater le numéro (retirer le + si présent)
-                const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-                
-                const pairingCode = await sock.requestPairingCode(cleanPhone);
-                console.log(`Pairing code obtenu: ${pairingCode}`);
-                
-                hasReceivedCode = true;
-                
-                // Sauvegarder le pairing code dans qr_code (il sera affiché en gros texte)
-                const { error } = await supabase
-                    .from('instances')
-                    .update({ qr_code: pairingCode, status: 'scanning' })
-                    .eq('id', instanceId);
-                
-                if (error) {
-                    console.error(`Erreur sauvegarde pairing code:`, error.message);
-                } else {
-                    console.log(`Pairing code sauvegarde pour ${instanceId}`);
+                } catch (err) {
+                    console.error("❌ Erreur Pairing Code:", err.message);
                 }
-            } catch (err) {
-                console.error(`Erreur requestPairingCode:`, err.message);
+            }, 4000); // On attend 4s que la connexion soit prête
+        }
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            // Si QR Code (seulement si pas de numéro demandé)
+            if (qr && !phoneNumber) {
+                console.log("⚡ QR généré");
+                await supabase.from('instances').update({ qr_code: qr, status: 'scanning' }).eq('id', instanceId);
             }
-        }
 
-        if (connection === 'open') {
-            console.log(`${instanceId} est connecte !`);
-            await supabase
-                .from('instances')
-                .update({ qr_code: null, status: 'connected' })
-                .eq('id', instanceId);
-        }
-
-        if (connection === 'close') {
-            activeSessions.delete(instanceId);
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            console.log(`Deconnexion ${instanceId}. Code: ${statusCode}. Reconnexion: ${shouldReconnect}`);
-            
-            if (shouldReconnect) {
-                setTimeout(() => startWhatsApp(instanceId, phoneNumber), 3000);
-            } else {
-                await supabase
-                    .from('instances')
-                    .update({ status: 'disconnected', qr_code: null })
-                    .eq('id', instanceId);
+            if (connection === 'open') {
+                console.log(`✅ CONNECTÉ : ${instanceId}`);
+                await supabase.from('instances').update({ qr_code: null, status: 'connected' }).eq('id', instanceId);
             }
-        }
-    });
 
-    sock.ev.on('creds.update', saveCreds);
-    
-    return sock;
+            if (connection === 'close') {
+                const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+                console.log(`❌ Déconnexion (${lastDisconnect.error?.output?.statusCode}). Reconnexion : ${shouldReconnect}`);
+                
+                if (shouldReconnect) {
+                    startWhatsApp(instanceId, phoneNumber);
+                } else {
+                    await supabase.from('instances').update({ status: 'disconnected' }).eq('id', instanceId);
+                }
+            }
+        });
+
+        sock.ev.on('creds.update', saveCreds);
+        
+    } catch (e) {
+        console.error("Erreur fatale startWhatsApp:", e);
+    }
 };
 
-// --- ROUTES API ---
-
-app.get('/', (req, res) => {
-    res.json({ 
-        status: 'running', 
-        message: 'WhatsApp Worker is Running',
-        activeSessions: activeSessions.size,
-        supabaseUrl: SUPABASE_URL
-    });
-});
-
-app.get('/health', (req, res) => {
-    res.json({ status: 'ok', activeSessions: activeSessions.size });
-});
+// ROUTES
+app.get('/', (req, res) => res.send('Worker is Runnnig 🚀'));
 
 app.post('/init-session', async (req, res) => {
     const { instanceId, phoneNumber } = req.body;
-    
-    if (!instanceId) {
-        return res.status(400).json({ error: 'instanceId manquant' });
-    }
+    if (!instanceId) return res.status(400).json({ error: 'Missing instanceId' });
 
-    console.log(`Recu demande init pour ${instanceId}${phoneNumber ? ` avec phone ${phoneNumber}` : ''}`);
-    
-    // Vérifier que l'instance existe
-    const { data: instance, error: fetchError } = await supabase
-        .from('instances')
-        .select('id, status')
-        .eq('id', instanceId)
-        .single();
+    // On lance le processus en arrière-plan
+    startWhatsApp(instanceId, phoneNumber).catch(e => console.error(e));
 
-    if (fetchError || !instance) {
-        console.error(`Instance ${instanceId} non trouvee:`, fetchError?.message);
-        return res.status(404).json({ error: 'Instance non trouvee dans Supabase' });
-    }
-
-    // Lancer le processus WhatsApp
-    startWhatsApp(instanceId, phoneNumber || null).catch(err => {
-        console.error("Erreur startWhatsApp:", err);
-    });
-    
     return res.json({ 
         status: 'initializing', 
-        message: phoneNumber 
-            ? 'Demande de pairing code en cours...'
-            : 'Demarrage en cours, QR code bientot disponible...',
-        instanceId,
-        mode: phoneNumber ? 'phone' : 'qr'
+        message: phoneNumber ? 'Code en cours...' : 'QR en cours...' 
     });
 });
 
-app.post('/disconnect/:instanceId', async (req, res) => {
-    const { instanceId } = req.params;
-    
-    if (activeSessions.has(instanceId)) {
-        try {
-            activeSessions.get(instanceId).end();
-        } catch (e) {}
-        activeSessions.delete(instanceId);
-    }
-
-    await supabase
-        .from('instances')
-        .update({ status: 'disconnected', qr_code: null })
-        .eq('id', instanceId);
-
-    res.json({ status: 'disconnected', instanceId });
-});
-
-// --- DEMARRAGE ---
-app.listen(PORT, () => {
-    console.log(`Worker WhatsApp demarre sur le port ${PORT}`);
-    console.log(`Supabase URL: ${SUPABASE_URL}`);
-});
+app.listen(PORT, () => console.log(`Serveur sur le port ${PORT}`));
