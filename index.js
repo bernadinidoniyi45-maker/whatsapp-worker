@@ -17,42 +17,85 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================
-// 💾 FONCTION DE SAUVEGARDE (C'est la nouveauté !)
+// 🧠 FONCTION IA GROQ (AVEC MÉMOIRE)
+// ============================================================
+async function askGroqAI(currentMessage, systemPrompt, history = []) {
+    if (!GROQ_API_KEY) return "⚠️ Erreur Config IA";
+
+    const finalPrompt = systemPrompt || "Tu es un assistant utile sur WhatsApp.";
+
+    // On prépare la conversation : Prompt Système + Historique + Nouveau message
+    const messagesToSend = [
+        { role: "system", content: finalPrompt },
+        ...history, // On insère le passé ici
+        { role: "user", content: currentMessage }
+    ];
+
+    try {
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${GROQ_API_KEY}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                model: "llama3-70b-8192",
+                messages: messagesToSend,
+                temperature: 0.7,
+                max_tokens: 400
+            })
+        });
+
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content || null;
+
+    } catch (error) {
+        console.error("❌ Erreur Groq:", error);
+        return null;
+    }
+}
+
+// ============================================================
+// 💾 FONCTION DE SAUVEGARDE
 // ============================================================
 async function saveMessageToDb(instanceId, text, sender, isFromMe) {
     try {
         await supabase.from('messages').insert({
             instance_id: instanceId,
             content: text,
-            sender: sender.replace('@s.whatsapp.net', ''), // On nettoie le numéro
+            sender: sender.replace('@s.whatsapp.net', ''),
             is_from_me: isFromMe,
             created_at: new Date()
         });
-        console.log(`💾 Message sauvegardé en base pour ${instanceId}`);
-    } catch (e) {
-        console.error("❌ Erreur sauvegarde DB:", e);
-    }
+    } catch (e) { console.error("❌ Erreur DB:", e); }
 }
 
 // ============================================================
-// 🧠 FONCTION IA GROQ
+// 🕰️ FONCTION POUR RÉCUPÉRER L'HISTORIQUE
 // ============================================================
-async function askGroqAI(userMessage, systemPrompt) {
-    if (!GROQ_API_KEY) return "⚠️ Erreur Config IA";
-    const finalPrompt = systemPrompt || "Tu es un assistant utile.";
+async function getConversationHistory(instanceId, sender) {
     try {
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-            method: "POST",
-            headers: { "Authorization": `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" },
-            body: JSON.stringify({
-                model: "llama3-70b-8192",
-                messages: [{ role: "system", content: finalPrompt }, { role: "user", content: userMessage }],
-                temperature: 0.7, max_tokens: 400
-            })
-        });
-        const data = await response.json();
-        return data.choices?.[0]?.message?.content || null;
-    } catch (error) { return null; }
+        // On récupère les 10 derniers messages de CE client avec CET agent
+        const { data } = await supabase
+            .from('messages')
+            .select('content, is_from_me')
+            .eq('instance_id', instanceId)
+            .eq('sender', sender.replace('@s.whatsapp.net', '')) // Filtre par client
+            .order('created_at', { ascending: false }) // Du plus récent au plus vieux
+            .limit(10); // On garde juste les 10 derniers pour pas surcharger l'IA
+
+        if (!data) return [];
+
+        // On remet dans le bon ordre (Chronologique) et au format OpenAI
+        return data.reverse().map(msg => ({
+            role: msg.is_from_me ? "assistant" : "user",
+            content: msg.content
+        }));
+
+    } catch (e) {
+        console.error("Erreur historique:", e);
+        return [];
+    }
 }
 
 // ============================================================
@@ -70,12 +113,10 @@ async function sendToUserWebhook(webhookUrl, messageData) {
 }
 
 // ============================================================
-// GESTION SESSION (Idem avant)
+// GESTION SESSION (Code standard)
 // ============================================================
 const memoryCache = new Map();
 const useSupabaseAuth = async (sessionId) => {
-    // ... (Garde le même code de gestion de session que je t'ai donné avant, c'est le même bloc)
-    // Pour alléger la réponse, je remets l'essentiel :
     const writeData = async (data, key) => { try { memoryCache.set(`${sessionId}-${key}`, data); await supabase.from('whatsapp_sessions').upsert({ session_id: sessionId, key_id: key, data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) }); } catch (e) {} };
     const readData = async (key) => { try { if (memoryCache.has(`${sessionId}-${key}`)) return memoryCache.get(`${sessionId}-${key}`); const { data } = await supabase.from('whatsapp_sessions').select('data').eq('session_id', sessionId).eq('key_id', key).single(); return data?.data ? JSON.parse(JSON.stringify(data.data), BufferJSON.reviver) : null; } catch (e) { return null; } };
     const removeData = async (key) => { try { memoryCache.delete(`${sessionId}-${key}`); await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId).eq('key_id', key); } catch (e) {} };
@@ -84,10 +125,10 @@ const useSupabaseAuth = async (sessionId) => {
 };
 
 // ============================================================
-// 🤖 LE ROBOT AVEC SAUVEGARDE
+// 🤖 LE ROBOT INTELLIGENT
 // ============================================================
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`🚀 Démarrage Instance : ${instanceId}`);
+    console.log(`🚀 Démarrage Instance SaaS : ${instanceId}`);
     try {
         const { state, saveCreds } = await useSupabaseAuth(instanceId);
         const { version } = await fetchLatestBaileysVersion();
@@ -110,31 +151,45 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
                     const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
 
                     if (text) {
-                        console.log(`📩 Reçu de ${cleanSender}: ${text}`);
+                        console.log(`📩 Reçu de ${cleanSender} pour ${instanceId}: ${text}`);
                         
-                        // 1. SAUVEGARDER LE MESSAGE REÇU (USER) 📥
+                        // 1. SAUVEGARDER LE MESSAGE USER 📥
                         await saveMessageToDb(instanceId, text, cleanSender, false);
 
-                        // 2. RÉCUPÉRER LA CONFIG
+                        // 2. RECUPÉRER CONFIG + HISTORIQUE
                         let config = { system_prompt: null, webhook_url: null };
+                        let history = [];
+                        
                         try {
+                            // Config de l'agent
                             const { data } = await supabase.from('instances').select('system_prompt, webhook_url').eq('id', instanceId).single();
                             if (data) config = data;
-                        } catch (e) {}
+
+                            // Historique de conversation (Si pas de webhook)
+                            if (!config.webhook_url) {
+                                history = await getConversationHistory(instanceId, sender);
+                            }
+
+                        } catch (e) { console.error("Erreur lecture données", e); }
 
                         // 3. GÉNÉRER LA RÉPONSE
                         let replyText = null;
+                        
+                        await sock.sendPresenceUpdate('composing', sender);
+
                         if (config.webhook_url) {
+                            // Mode Webhook (Pas besoin d'historique ici, le site gère)
                             replyText = await sendToUserWebhook(config.webhook_url, { event: "message", instance_id: instanceId, from: cleanSender, body: text });
                         } else {
-                            replyText = await askGroqAI(text, config.system_prompt);
+                            // Mode IA (Avec Mémoire !)
+                            replyText = await askGroqAI(text, config.system_prompt, history);
                         }
 
-                        // 4. ENVOYER ET SAUVEGARDER LA RÉPONSE (BOT) 📤
+                        // 4. ENVOYER ET SAUVEGARDER RÉPONSE 📤
                         if (replyText) {
                             await sock.sendMessage(sender, { text: replyText });
-                            await saveMessageToDb(instanceId, replyText, cleanSender, true); // TRUE = C'est le robot
-                            console.log(`📤 Réponse envoyée et sauvegardée.`);
+                            await saveMessageToDb(instanceId, replyText, cleanSender, true);
+                            console.log(`📤 Réponse envoyée.`);
                         }
                     }
                 }
