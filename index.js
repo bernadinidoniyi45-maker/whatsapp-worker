@@ -9,24 +9,22 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 3000;
 
-// Verification de securite au demarrage
 if (!SUPABASE_URL || !SUPABASE_KEY) {
     console.error("ERREUR CRITIQUE: Variables SUPABASE manquantes.");
-    process.exit(1); // Arreter le processus si config manquante
+    process.exit(1);
 }
 
-console.log(`Connexion Supabase: ${SUPABASE_URL}`); // Log pour debug
+console.log(`Connexion Supabase: ${SUPABASE_URL}`);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app = express();
 
-// Stockage des sessions actives en memoire
 const activeSessions = new Map();
 
 app.use(cors());
 app.use(express.json());
 
-// --- 1. GESTION DE LA SAUVEGARDE (Supabase Auth) ---
+// --- GESTION AUTH SUPABASE ---
 const useSupabaseAuth = async (sessionId) => {
     const writeData = async (data, key) => {
         const { error } = await supabase
@@ -88,11 +86,11 @@ const useSupabaseAuth = async (sessionId) => {
     };
 };
 
-// --- 2. MOTEUR WHATSAPP ---
-const startWhatsApp = async (instanceId) => {
-    console.log(`Demarrage session pour: ${instanceId}`);
+// --- MOTEUR WHATSAPP ---
+const startWhatsApp = async (instanceId, phoneNumber = null) => {
+    console.log(`Demarrage session pour: ${instanceId}${phoneNumber ? ` (phone: ${phoneNumber})` : ' (QR mode)'}`);
     
-    // Eviter les sessions dupliquees
+    // Éviter les sessions dupliquées
     if (activeSessions.has(instanceId)) {
         console.log(`Session ${instanceId} deja active, fermeture...`);
         try {
@@ -104,26 +102,28 @@ const startWhatsApp = async (instanceId) => {
     const { state, saveCreds } = await useSupabaseAuth(instanceId);
     const { version } = await fetchLatestBaileysVersion();
 
-        const sock = makeWASocket({
+    const sock = makeWASocket({
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: true,
-        // 👇 C'EST ICI QUE ÇA SE JOUE 👇
-        browser: ["Ubuntu", "Chrome", "20.0.04"], // 1. Identité stable (Linux)
-        syncFullHistory: false,                   // 2. ⚠️ INDISPENSABLE : Empêche le crash mémoire
+        printQRInTerminal: !phoneNumber, // Désactiver si mode téléphone
+        browser: ["Ubuntu", "Chrome", "20.0.04"], // Anti-crash config
+        syncFullHistory: false, // Anti-crash: évite le téléchargement lourd
         connectTimeoutMs: 60000,
     });
 
-
-
     activeSessions.set(instanceId, sock);
+
+    // Variable pour tracker si on a déjà reçu un QR/code
+    let hasReceivedCode = false;
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        if (qr) {
-            console.log(`QR Code recu pour ${instanceId}! Mise a jour Supabase...`);
+        // MODE QR CODE
+        if (qr && !phoneNumber) {
+            console.log(`QR Code recu pour ${instanceId}!`);
+            hasReceivedCode = true;
             const { error } = await supabase
                 .from('instances')
                 .update({ qr_code: qr, status: 'scanning' })
@@ -132,7 +132,36 @@ const startWhatsApp = async (instanceId) => {
             if (error) {
                 console.error(`Erreur update QR:`, error.message);
             } else {
-                console.log(`QR sauvegarde avec succes pour ${instanceId}`);
+                console.log(`QR sauvegarde pour ${instanceId}`);
+            }
+        }
+
+        // MODE TÉLÉPHONE - Demander le pairing code
+        if (phoneNumber && !hasReceivedCode && connection !== 'open' && connection !== 'close') {
+            try {
+                console.log(`Demande de pairing code pour ${phoneNumber}...`);
+                
+                // Formater le numéro (retirer le + si présent)
+                const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
+                
+                const pairingCode = await sock.requestPairingCode(cleanPhone);
+                console.log(`Pairing code obtenu: ${pairingCode}`);
+                
+                hasReceivedCode = true;
+                
+                // Sauvegarder le pairing code dans qr_code (il sera affiché en gros texte)
+                const { error } = await supabase
+                    .from('instances')
+                    .update({ qr_code: pairingCode, status: 'scanning' })
+                    .eq('id', instanceId);
+                
+                if (error) {
+                    console.error(`Erreur sauvegarde pairing code:`, error.message);
+                } else {
+                    console.log(`Pairing code sauvegarde pour ${instanceId}`);
+                }
+            } catch (err) {
+                console.error(`Erreur requestPairingCode:`, err.message);
             }
         }
 
@@ -151,7 +180,7 @@ const startWhatsApp = async (instanceId) => {
             console.log(`Deconnexion ${instanceId}. Code: ${statusCode}. Reconnexion: ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                setTimeout(() => startWhatsApp(instanceId), 3000); // Delai avant reconnexion
+                setTimeout(() => startWhatsApp(instanceId, phoneNumber), 3000);
             } else {
                 await supabase
                     .from('instances')
@@ -166,7 +195,7 @@ const startWhatsApp = async (instanceId) => {
     return sock;
 };
 
-// --- 3. ROUTES API ---
+// --- ROUTES API ---
 
 app.get('/', (req, res) => {
     res.json({ 
@@ -182,15 +211,15 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/init-session', async (req, res) => {
-    const { instanceId } = req.body;
+    const { instanceId, phoneNumber } = req.body;
     
     if (!instanceId) {
         return res.status(400).json({ error: 'instanceId manquant' });
     }
 
-    console.log(`Recu demande init pour ${instanceId}`);
+    console.log(`Recu demande init pour ${instanceId}${phoneNumber ? ` avec phone ${phoneNumber}` : ''}`);
     
-    // Verifier que l'instance existe dans Supabase
+    // Vérifier que l'instance existe
     const { data: instance, error: fetchError } = await supabase
         .from('instances')
         .select('id, status')
@@ -203,14 +232,17 @@ app.post('/init-session', async (req, res) => {
     }
 
     // Lancer le processus WhatsApp
-    startWhatsApp(instanceId).catch(err => {
+    startWhatsApp(instanceId, phoneNumber || null).catch(err => {
         console.error("Erreur startWhatsApp:", err);
     });
     
     return res.json({ 
         status: 'initializing', 
-        message: 'Demarrage en cours, QR code bientot disponible...',
-        instanceId 
+        message: phoneNumber 
+            ? 'Demande de pairing code en cours...'
+            : 'Demarrage en cours, QR code bientot disponible...',
+        instanceId,
+        mode: phoneNumber ? 'phone' : 'qr'
     });
 });
 
@@ -232,7 +264,7 @@ app.post('/disconnect/:instanceId', async (req, res) => {
     res.json({ status: 'disconnected', instanceId });
 });
 
-// --- 4. DEMARRAGE ---
+// --- DEMARRAGE ---
 app.listen(PORT, () => {
     console.log(`Worker WhatsApp demarre sur le port ${PORT}`);
     console.log(`Supabase URL: ${SUPABASE_URL}`);
