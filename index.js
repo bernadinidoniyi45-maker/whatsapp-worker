@@ -72,7 +72,7 @@ const useSupabaseAuth = async (sessionId) => {
 };
 
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`🚀 Démarrage session : ${instanceId}`);
+    console.log(`🚀 Démarrage session (Mode Android): ${instanceId}`);
     try {
         const { state, saveCreds } = await useSupabaseAuth(instanceId);
         const { version } = await fetchLatestBaileysVersion();
@@ -81,11 +81,14 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
             version,
             auth: state,
             logger: pino({ level: 'silent' }),
-            browser: ["Ubuntu", "Chrome", "20.0.04"],
+            // 👇 ICI : ON SE DÉGUISE EN WINDOWS POUR TROMPER ANDROID 👇
+            browser: ["Windows", "Chrome", "10.15.7"], 
+            // 👆 C'est la clé pour que ton Android accepte la connexion
+            
             syncFullHistory: false,
-            connectTimeoutMs: 120000,      
-            defaultQueryTimeoutMs: 120000, 
-            keepAliveIntervalMs: 30000,
+            connectTimeoutMs: 60000,      
+            defaultQueryTimeoutMs: 60000, 
+            keepAliveIntervalMs: 10000, // On envoie un signal plus souvent pour Android
             getMessage: async (key) => { return { conversation: 'Hello' }; },
         });
 
@@ -98,23 +101,30 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
                     console.log(`🔑 CODE REÇU : ${code}`);
                     await supabase.from('instances').update({ qr_code: code, status: 'pairing_code' }).eq('id', instanceId);
                 } catch (err) { console.error("❌ Erreur code:", err.message); }
-            }, 6000); 
+            }, 5000); 
         }
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
+            
             if (qr && !phoneNumber) {
                 await supabase.from('instances').update({ qr_code: qr, status: 'scanning' }).eq('id', instanceId);
             }
+            
             if (connection === 'open') {
                 console.log(`✅ CONNECTÉ !`);
                 await supabase.from('instances').update({ qr_code: null, status: 'connected' }).eq('id', instanceId);
             }
+            
             if (connection === 'close') {
                 const statusCode = (lastDisconnect.error)?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401 && statusCode !== 403;
+                
                 if (shouldReconnect) startWhatsApp(instanceId, phoneNumber);
-                else await supabase.from('instances').update({ status: 'disconnected', qr_code: null }).eq('id', instanceId);
+                else {
+                    // Nettoyage partiel seulement en cas d'échec total
+                    await supabase.from('instances').update({ status: 'disconnected', qr_code: null }).eq('id', instanceId);
+                }
             }
         });
 
@@ -122,27 +132,17 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
     } catch (e) { console.error("🚨 Erreur fatale:", e); }
 };
 
-app.get('/', (req, res) => res.send('Worker en ligne 🟢'));
+app.get('/', (req, res) => res.send('Worker Android Ready 🟢'));
 
 app.post('/init-session', async (req, res) => {
     const { instanceId, phoneNumber } = req.body;
     if (!instanceId) return res.status(400).json({ error: 'ID manquant' });
 
-    console.log(`🔄 Reset partiel pour ${instanceId}`);
+    console.log(`🔄 Préparation Android pour ${instanceId}`);
     try {
-        // 1. On supprime les anciennes clés de session (obligatoire pour nouveau code)
         await supabase.from('whatsapp_sessions').delete().eq('session_id', instanceId);
-        
-        // 2. MODIFICATION : On ne supprime plus l'instance, on met juste à jour
-        await supabase.from('instances')
-            .update({ 
-                qr_code: null, 
-                status: 'initializing' 
-            })
-            .eq('id', instanceId);
-            
-        console.log("✨ Reset terminé, instance maintenue.");
-    } catch (e) { console.error("Erreur reset:", e.message); }
+        await supabase.from('instances').update({ qr_code: null, status: 'initializing' }).eq('id', instanceId);
+    } catch (e) {}
 
     startWhatsApp(instanceId, phoneNumber).catch(e => console.error(e));
     return res.json({ status: 'started' });
