@@ -104,14 +104,18 @@ const startWhatsApp = async (instanceId) => {
     const { state, saveCreds } = await useSupabaseAuth(instanceId);
     const { version } = await fetchLatestBaileysVersion();
 
-    const sock = makeWASocket({
+        const sock = makeWASocket({
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
         printQRInTerminal: true,
-        browser: ["Mon SaaS Automation", "Chrome", "1.0.0"],
+        // 👇 LE CHANGEMENT EST ICI 👇
+        browser: ["Ubuntu", "Chrome", "20.0.04"], // On se fait passer pour Linux
         connectTimeoutMs: 60000,
+        syncFullHistory: false, // ⚠️ TRES IMPORTANT : Evite de surcharger le serveur au scan
+        markOnlineOnConnect: false,
     });
+
 
     activeSessions.set(instanceId, sock);
 
