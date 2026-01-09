@@ -6,6 +6,7 @@ const pino = require('pino');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY; // Ta clé configurée dans Render
 const PORT = process.env.PORT || 3000;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -14,6 +15,44 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- FONCTION POUR PARLER À GROQ (L'INTELLIGENCE) ---
+async function askGroqAI(userMessage) {
+    if (!GROQ_API_KEY) return "⚠️ Erreur : La clé API Groq n'est pas configurée dans Render.";
+
+    try {
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${GROQ_API_KEY}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                model: "llama3-70b-8192", // Modèle rapide et intelligent
+                messages: [
+                    {
+                        role: "system",
+                        content: "Tu es HOSTILEGOT DIGITAL, un assistant virtuel IA utile, sympathique et professionnel. Tu tutoies l'utilisateur si l'ambiance est décontractée. Tu es là pour aider, répondre aux questions et discuter. Tes réponses sont concises et claires pour WhatsApp."
+                    },
+                    {
+                        role: "user",
+                        content: userMessage
+                    }
+                ],
+                temperature: 0.7,
+                max_tokens: 300
+            })
+        });
+
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content || "Désolé, je suis un peu fatigué (Erreur IA).";
+
+    } catch (error) {
+        console.error("Erreur Groq:", error);
+        return "Une erreur technique m'empêche de répondre pour l'instant.";
+    }
+}
+
+// --- GESTION DE LA SESSION WHATSAPP ---
 const memoryCache = new Map();
 
 const useSupabaseAuth = async (sessionId) => {
@@ -78,7 +117,7 @@ const useSupabaseAuth = async (sessionId) => {
 };
 
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`🚀 Démarrage session PRO : ${instanceId}`);
+    console.log(`🚀 Démarrage HOSTILEGOT DIGITAL : ${instanceId}`);
     try {
         const { state, saveCreds } = await useSupabaseAuth(instanceId);
         const { version } = await fetchLatestBaileysVersion();
@@ -93,42 +132,32 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
             defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 10000,
             emitOwnEvents: true,
-            shouldIgnoreJid: jid => isJidBroadcast(jid) || jid.includes('status'), // Ignore les statuts/stories
+            shouldIgnoreJid: jid => isJidBroadcast(jid) || jid.includes('status'),
             getMessage: async (key) => { return { conversation: 'Hello' }; },
         });
 
-        // --- 🧠 CERVEAU INTELLIGENT ---
+        // --- 🤖 LE CERVEAU IA EST ICI ---
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
 
             for (const msg of messages) {
-                if (!msg.key.fromMe) { // Ignore mes propres messages
+                if (!msg.key.fromMe) {
                     const sender = msg.key.remoteJid;
-                    console.log(`📩 Message reçu de ${sender}`);
+                    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
 
-                    try {
-                        // 1. DÉTECTION DU CONTENU
-                        const isText = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
-                        const isImage = msg.message?.imageMessage;
-                        const isAudio = msg.message?.audioMessage;
+                    if (text) {
+                        console.log(`📩 Question reçue : ${text}`);
+                        
+                        // Simulation "En train d'écrire..." pour faire humain
+                        await sock.sendPresenceUpdate('composing', sender);
 
-                        if (isText) {
-                            console.log(`💬 Texte : ${isText}`);
-                            // Réponse au texte
-                            await sock.sendMessage(sender, { text: `🤖 J'ai bien reçu ton message : "${isText}"` });
-                        } 
-                        else if (isImage) {
-                            console.log(`📷 Image reçue`);
-                            // Réponse à l'image
-                            await sock.sendMessage(sender, { text: "🤖 Wow, belle photo ! Je l'ai bien reçue." });
-                        }
-                        else if (isAudio) {
-                            console.log(`🎤 Audio reçu`);
-                            await sock.sendMessage(sender, { text: "🤖 J'ai bien reçu ton vocal." });
-                        }
+                        // On demande la réponse à l'IA Groq
+                        const aiResponse = await askGroqAI(text);
+                        
+                        console.log(`🤖 Réponse IA : ${aiResponse}`);
 
-                    } catch (error) {
-                        console.error("❌ Erreur réponse:", error);
+                        // On envoie la réponse
+                        await sock.sendMessage(sender, { text: aiResponse });
                     }
                 }
             }
@@ -155,7 +184,7 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
     } catch (e) { console.error("🚨 Erreur fatale:", e); }
 };
 
-app.get('/', (req, res) => res.send('Chatbot Pro Ready 🟢'));
+app.get('/', (req, res) => res.send('HOSTILEGOT AI Ready 🟢'));
 
 app.post('/init-session', async (req, res) => {
     const { instanceId, phoneNumber } = req.body;
