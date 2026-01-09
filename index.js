@@ -1,7 +1,7 @@
 const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
-const cors = require('cors'); // <--- IMPORTATION DU FIX
+const cors = require('cors');
 const pino = require('pino');
 
 // --- CONFIGURATION ---
@@ -9,17 +9,20 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 3000;
 
-// Vérification de sécurité au démarrage
+// Verification de securite au demarrage
 if (!SUPABASE_URL || !SUPABASE_KEY) {
     console.error("ERREUR CRITIQUE: Variables SUPABASE manquantes.");
-    // On ne coupe pas le processus brutalement pour laisser Render afficher les logs, 
-    // mais le serveur ne pourra pas sauvegarder.
+    process.exit(1); // Arreter le processus si config manquante
 }
+
+console.log(`Connexion Supabase: ${SUPABASE_URL}`); // Log pour debug
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app = express();
 
-// --- ACTIVATION DU FIX (Autorise Lovable) ---
+// Stockage des sessions actives en memoire
+const activeSessions = new Map();
+
 app.use(cors());
 app.use(express.json());
 
@@ -28,7 +31,12 @@ const useSupabaseAuth = async (sessionId) => {
     const writeData = async (data, key) => {
         const { error } = await supabase
             .from('whatsapp_sessions')
-            .upsert({ session_id: sessionId, key_id: key, data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) });
+            .upsert({ 
+                session_id: sessionId, 
+                key_id: key, 
+                data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)),
+                updated_at: new Date().toISOString()
+            });
         if (error) console.error('Erreur sauvegarde Auth:', error.message);
     };
 
@@ -82,7 +90,17 @@ const useSupabaseAuth = async (sessionId) => {
 
 // --- 2. MOTEUR WHATSAPP ---
 const startWhatsApp = async (instanceId) => {
-    console.log(`🚀 Démarrage session pour: ${instanceId}`);
+    console.log(`Demarrage session pour: ${instanceId}`);
+    
+    // Eviter les sessions dupliquees
+    if (activeSessions.has(instanceId)) {
+        console.log(`Session ${instanceId} deja active, fermeture...`);
+        try {
+            activeSessions.get(instanceId).end();
+        } catch (e) {}
+        activeSessions.delete(instanceId);
+    }
+
     const { state, saveCreds } = await useSupabaseAuth(instanceId);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -95,20 +113,27 @@ const startWhatsApp = async (instanceId) => {
         connectTimeoutMs: 60000,
     });
 
+    activeSessions.set(instanceId, sock);
+
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log("⚡ QR Code reçu ! Mise à jour de Supabase...");
-            // C'est ici que le VRAI QR remplace le 'demo-qr'
-            await supabase
+            console.log(`QR Code recu pour ${instanceId}! Mise a jour Supabase...`);
+            const { error } = await supabase
                 .from('instances')
                 .update({ qr_code: qr, status: 'scanning' })
                 .eq('id', instanceId);
+            
+            if (error) {
+                console.error(`Erreur update QR:`, error.message);
+            } else {
+                console.log(`QR sauvegarde avec succes pour ${instanceId}`);
+            }
         }
 
         if (connection === 'open') {
-            console.log(`✅ ${instanceId} est connecté !`);
+            console.log(`${instanceId} est connecte !`);
             await supabase
                 .from('instances')
                 .update({ qr_code: null, status: 'connected' })
@@ -116,11 +141,13 @@ const startWhatsApp = async (instanceId) => {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`❌ Déconnexion. Reconnexion auto: ${shouldReconnect}`);
+            activeSessions.delete(instanceId);
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            console.log(`Deconnexion ${instanceId}. Code: ${statusCode}. Reconnexion: ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                startWhatsApp(instanceId);
+                setTimeout(() => startWhatsApp(instanceId), 3000); // Delai avant reconnexion
             } else {
                 await supabase
                     .from('instances')
@@ -131,12 +158,23 @@ const startWhatsApp = async (instanceId) => {
     });
 
     sock.ev.on('creds.update', saveCreds);
+    
+    return sock;
 };
 
 // --- 3. ROUTES API ---
 
 app.get('/', (req, res) => {
-    res.send('WhatsApp Worker is Running with CORS fix 🚀');
+    res.json({ 
+        status: 'running', 
+        message: 'WhatsApp Worker is Running',
+        activeSessions: activeSessions.size,
+        supabaseUrl: SUPABASE_URL
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', activeSessions: activeSessions.size });
 });
 
 app.post('/init-session', async (req, res) => {
@@ -146,12 +184,52 @@ app.post('/init-session', async (req, res) => {
         return res.status(400).json({ error: 'instanceId manquant' });
     }
 
-    console.log(`Reçu demande init pour ${instanceId}`);
+    console.log(`Recu demande init pour ${instanceId}`);
     
-    // On lance le processus
-    startWhatsApp(instanceId).catch(err => console.error("Erreur startWhatsApp:", err));
+    // Verifier que l'instance existe dans Supabase
+    const { data: instance, error: fetchError } = await supabase
+        .from('instances')
+        .select('id, status')
+        .eq('id', instanceId)
+        .single();
+
+    if (fetchError || !instance) {
+        console.error(`Instance ${instanceId} non trouvee:`, fetchError?.message);
+        return res.status(404).json({ error: 'Instance non trouvee dans Supabase' });
+    }
+
+    // Lancer le processus WhatsApp
+    startWhatsApp(instanceId).catch(err => {
+        console.error("Erreur startWhatsApp:", err);
+    });
     
-    return res.json({ status: 'initializing', message: 'Démarrage en cours...' });
+    return res.json({ 
+        status: 'initializing', 
+        message: 'Demarrage en cours, QR code bientot disponible...',
+        instanceId 
+    });
 });
 
-app.listen(PORT, () => console.log(`Serveur démarré sur le port ${PORT}`));
+app.post('/disconnect/:instanceId', async (req, res) => {
+    const { instanceId } = req.params;
+    
+    if (activeSessions.has(instanceId)) {
+        try {
+            activeSessions.get(instanceId).end();
+        } catch (e) {}
+        activeSessions.delete(instanceId);
+    }
+
+    await supabase
+        .from('instances')
+        .update({ status: 'disconnected', qr_code: null })
+        .eq('id', instanceId);
+
+    res.json({ status: 'disconnected', instanceId });
+});
+
+// --- 4. DEMARRAGE ---
+app.listen(PORT, () => {
+    console.log(`Worker WhatsApp demarre sur le port ${PORT}`);
+    console.log(`Supabase URL: ${SUPABASE_URL}`);
+});
