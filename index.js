@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState, isJidBroadcast } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 const cors = require('cors');
@@ -14,7 +14,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- CACHE ---
 const memoryCache = new Map();
 
 const useSupabaseAuth = async (sessionId) => {
@@ -79,7 +78,7 @@ const useSupabaseAuth = async (sessionId) => {
 };
 
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`🚀 Démarrage session ESPION : ${instanceId}`);
+    console.log(`🚀 Démarrage session PRO : ${instanceId}`);
     try {
         const { state, saveCreds } = await useSupabaseAuth(instanceId);
         const { version } = await fetchLatestBaileysVersion();
@@ -88,31 +87,48 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
             version,
             auth: state,
             logger: pino({ level: 'silent' }),
-            browser: ["Mac OS", "Desktop", "10.15.7"], 
+            browser: ["Mac OS", "Chrome", "10.15.7"], 
             syncFullHistory: false,
             connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 10000,
+            emitOwnEvents: true,
+            shouldIgnoreJid: jid => isJidBroadcast(jid) || jid.includes('status'), // Ignore les statuts/stories
             getMessage: async (key) => { return { conversation: 'Hello' }; },
         });
 
-        // --- 🕵️‍♂️ MODE ESPION ACTIVÉ ---
+        // --- 🧠 CERVEAU INTELLIGENT ---
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            console.log(`📥 Événement reçu : ${type} avec ${messages.length} messages`);
-            
-            for (const msg of messages) {
-                // On affiche TOUT dans les logs pour comprendre
-                console.log("🔍 DÉTAIL MESSAGE:", JSON.stringify(msg, null, 2));
+            if (type !== 'notify') return;
 
-                if (!msg.key.fromMe && type === 'notify') {
+            for (const msg of messages) {
+                if (!msg.key.fromMe) { // Ignore mes propres messages
                     const sender = msg.key.remoteJid;
-                    console.log(`🎯 Message détecté de : ${sender}`);
+                    console.log(`📩 Message reçu de ${sender}`);
 
                     try {
-                        // Réponse simple pour tester
-                        await sock.sendMessage(sender, { text: "🤖 Test réussi ! Je reçois tes messages." });
-                        console.log("✅ Réponse envoyée !");
+                        // 1. DÉTECTION DU CONTENU
+                        const isText = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
+                        const isImage = msg.message?.imageMessage;
+                        const isAudio = msg.message?.audioMessage;
+
+                        if (isText) {
+                            console.log(`💬 Texte : ${isText}`);
+                            // Réponse au texte
+                            await sock.sendMessage(sender, { text: `🤖 J'ai bien reçu ton message : "${isText}"` });
+                        } 
+                        else if (isImage) {
+                            console.log(`📷 Image reçue`);
+                            // Réponse à l'image
+                            await sock.sendMessage(sender, { text: "🤖 Wow, belle photo ! Je l'ai bien reçue." });
+                        }
+                        else if (isAudio) {
+                            console.log(`🎤 Audio reçu`);
+                            await sock.sendMessage(sender, { text: "🤖 J'ai bien reçu ton vocal." });
+                        }
+
                     } catch (error) {
-                        console.error("❌ Erreur envoi:", error);
+                        console.error("❌ Erreur réponse:", error);
                     }
                 }
             }
@@ -120,19 +136,18 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
-            console.log(`⚡ Changement connexion : ${connection}`);
             
             if (qr && !phoneNumber) {
                 await supabase.from('instances').update({ qr_code: qr, status: 'scanning' }).eq('id', instanceId);
             }
             if (connection === 'open') {
-                console.log(`✅ CONNECTÉ ET PRÊT À RÉPONDRE !`);
+                console.log(`✅ CONNECTÉ !`);
                 await supabase.from('instances').update({ qr_code: null, status: 'connected' }).eq('id', instanceId);
             }
             if (connection === 'close') {
                 const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log(`❌ Déconnecté. Reconnexion : ${shouldReconnect}`);
                 if (shouldReconnect) startWhatsApp(instanceId, phoneNumber);
+                else await supabase.from('instances').update({ status: 'disconnected', qr_code: null }).eq('id', instanceId);
             }
         });
 
@@ -140,7 +155,7 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
     } catch (e) { console.error("🚨 Erreur fatale:", e); }
 };
 
-app.get('/', (req, res) => res.send('Espion en ligne 🕵️‍♂️'));
+app.get('/', (req, res) => res.send('Chatbot Pro Ready 🟢'));
 
 app.post('/init-session', async (req, res) => {
     const { instanceId, phoneNumber } = req.body;
