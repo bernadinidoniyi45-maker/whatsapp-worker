@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState, isJidBroadcast } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 const cors = require('cors');
@@ -14,7 +14,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- CACHE MÉMOIRE (Pour la vitesse) ---
+// --- CACHE ---
 const memoryCache = new Map();
 
 const useSupabaseAuth = async (sessionId) => {
@@ -79,7 +79,7 @@ const useSupabaseAuth = async (sessionId) => {
 };
 
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`🚀 Démarrage session : ${instanceId}`);
+    console.log(`🚀 Démarrage session ESPION : ${instanceId}`);
     try {
         const { state, saveCreds } = await useSupabaseAuth(instanceId);
         const { version } = await fetchLatestBaileysVersion();
@@ -91,69 +91,48 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
             browser: ["Mac OS", "Desktop", "10.15.7"], 
             syncFullHistory: false,
             connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000,
             keepAliveIntervalMs: 10000,
-            emitOwnEvents: true,
-            shouldIgnoreJid: jid => isJidBroadcast(jid),
             getMessage: async (key) => { return { conversation: 'Hello' }; },
         });
 
-        // --- GESTION DU CODE DE JUMELAGE ---
-        if (phoneNumber && !sock.authState.creds.registered) {
-            setTimeout(async () => {
-                try {
-                    const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-                    console.log(`📞 Demande code...`);
-                    const code = await sock.requestPairingCode(cleanPhone);
-                    console.log(`🔑 CODE : ${code}`);
-                    await supabase.from('instances').update({ qr_code: code, status: 'pairing_code' }).eq('id', instanceId);
-                } catch (err) { console.error("❌ Erreur code:", err.message); }
-            }, 3000);
-        }
-
-        // --- 🧠 LE CERVEAU DU ROBOT (C'est ici qu'il répond !) ---
+        // --- 🕵️‍♂️ MODE ESPION ACTIVÉ ---
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            try {
-                if (type === 'notify') {
-                    for (const msg of messages) {
-                        // On ignore les messages qui viennent de nous-même
-                        if (!msg.key.fromMe) {
-                            console.log('📩 Message reçu !');
-                            
-                            const sender = msg.key.remoteJid;
-                            const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
+            console.log(`📥 Événement reçu : ${type} avec ${messages.length} messages`);
+            
+            for (const msg of messages) {
+                // On affiche TOUT dans les logs pour comprendre
+                console.log("🔍 DÉTAIL MESSAGE:", JSON.stringify(msg, null, 2));
 
-                            if (text) {
-                                // 👇 ICI : EXEMPLE DE RÉPONSE AUTOMATIQUE 👇
-                                await sock.sendMessage(sender, { text: "👋 Bonjour ! Je suis ton assistant connecté via Render. J'ai bien reçu ton message : " + text });
-                                console.log('📤 Réponse envoyée');
-                            }
-                        }
+                if (!msg.key.fromMe && type === 'notify') {
+                    const sender = msg.key.remoteJid;
+                    console.log(`🎯 Message détecté de : ${sender}`);
+
+                    try {
+                        // Réponse simple pour tester
+                        await sock.sendMessage(sender, { text: "🤖 Test réussi ! Je reçois tes messages." });
+                        console.log("✅ Réponse envoyée !");
+                    } catch (error) {
+                        console.error("❌ Erreur envoi:", error);
                     }
                 }
-            } catch (error) {
-                console.error("Erreur traitement message:", error);
             }
         });
 
-        // --- GESTION DE LA CONNEXION ---
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
+            console.log(`⚡ Changement connexion : ${connection}`);
             
             if (qr && !phoneNumber) {
                 await supabase.from('instances').update({ qr_code: qr, status: 'scanning' }).eq('id', instanceId);
             }
-            
             if (connection === 'open') {
-                console.log(`✅ CONNECTÉ !`);
+                console.log(`✅ CONNECTÉ ET PRÊT À RÉPONDRE !`);
                 await supabase.from('instances').update({ qr_code: null, status: 'connected' }).eq('id', instanceId);
             }
-            
             if (connection === 'close') {
-                const statusCode = (lastDisconnect.error)?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401 && statusCode !== 403;
+                const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+                console.log(`❌ Déconnecté. Reconnexion : ${shouldReconnect}`);
                 if (shouldReconnect) startWhatsApp(instanceId, phoneNumber);
-                else await supabase.from('instances').update({ status: 'disconnected', qr_code: null }).eq('id', instanceId);
             }
         });
 
@@ -161,16 +140,10 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
     } catch (e) { console.error("🚨 Erreur fatale:", e); }
 };
 
-app.get('/', (req, res) => res.send('Worker Actif 🟢'));
+app.get('/', (req, res) => res.send('Espion en ligne 🕵️‍♂️'));
 
 app.post('/init-session', async (req, res) => {
     const { instanceId, phoneNumber } = req.body;
-    if (!instanceId) return res.status(400).json({ error: 'ID manquant' });
-
-    // Si on veut forcer un redémarrage propre :
-    // await supabase.from('whatsapp_sessions').delete().eq('session_id', instanceId); 
-    // (Mais si c'est déjà connecté, on évite de tout casser, on relance juste le processus)
-    
     startWhatsApp(instanceId, phoneNumber).catch(e => console.error(e));
     return res.json({ status: 'started' });
 });
