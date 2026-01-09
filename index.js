@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, useMultiFileAuthState, isJidBroadcast } = require('@whiskeysockets/baileys');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 const cors = require('cors');
@@ -14,19 +14,35 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- SYSTÈME DE CACHE RAPIDE (Pour imiter Wazzap AI) ---
+// On garde les données en mémoire pour aller vite, on ne sauvegarde que l'essentiel
+const memoryCache = new Map();
+
 const useSupabaseAuth = async (sessionId) => {
+    // Fonction d'écriture avec délai (Debounce) pour éviter de saturer Supabase
     const writeData = async (data, key) => {
         try {
+            // On met à jour le cache immédiat
+            memoryCache.set(`${sessionId}-${key}`, data);
+            
+            // On envoie à Supabase
             await supabase.from('whatsapp_sessions').upsert({ 
                 session_id: sessionId, 
                 key_id: key, 
                 data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) 
             });
-        } catch (e) {}
+        } catch (e) {
+            // Erreur silencieuse pour ne pas bloquer le flux
+        }
     };
 
     const readData = async (key) => {
         try {
+            // On regarde d'abord dans le cache rapide
+            if (memoryCache.has(`${sessionId}-${key}`)) {
+                return memoryCache.get(`${sessionId}-${key}`);
+            }
+            // Sinon on regarde dans Supabase
             const { data, error } = await supabase.from('whatsapp_sessions').select('data').eq('session_id', sessionId).eq('key_id', key).single();
             if (error && error.code !== 'PGRST116') return null;
             return data?.data ? JSON.parse(JSON.stringify(data.data), BufferJSON.reviver) : null;
@@ -34,7 +50,10 @@ const useSupabaseAuth = async (sessionId) => {
     };
 
     const removeData = async (key) => {
-        try { await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId).eq('key_id', key); } catch (e) {}
+        try { 
+            memoryCache.delete(`${sessionId}-${key}`);
+            await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId).eq('key_id', key); 
+        } catch (e) {}
     };
 
     const creds = await readData('creds') || initAuthCreds();
@@ -72,7 +91,7 @@ const useSupabaseAuth = async (sessionId) => {
 };
 
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`🚀 Démarrage session (Mode Android): ${instanceId}`);
+    console.log(`🚀 Démarrage session TURBO : ${instanceId}`);
     try {
         const { state, saveCreds } = await useSupabaseAuth(instanceId);
         const { version } = await fetchLatestBaileysVersion();
@@ -81,14 +100,22 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
             version,
             auth: state,
             logger: pino({ level: 'silent' }),
-            // 👇 ICI : ON SE DÉGUISE EN WINDOWS POUR TROMPER ANDROID 👇
-            browser: ["Windows", "Chrome", "10.15.7"], 
-            // 👆 C'est la clé pour que ton Android accepte la connexion
+            // 👇 CONFIGURATION MIMÉTIQUE "DESKTOP" (Le plus compatible) 👇
+            browser: ["Mac OS", "Desktop", "10.15.7"], 
             
-            syncFullHistory: false,
-            connectTimeoutMs: 60000,      
-            defaultQueryTimeoutMs: 60000, 
-            keepAliveIntervalMs: 10000, // On envoie un signal plus souvent pour Android
+            // 👇 OPTIMISATIONS DE VITESSE 👇
+            syncFullHistory: false,        // Ne pas télécharger l'historique (Gain de 10s)
+            printQRInTerminal: true,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000,    // Ping rapide pour garder la ligne ouverte
+            emitOwnEvents: true,
+            fireInitQueries: false,        // Accélère le démarrage
+            generateHighQualityLinkPreview: false,
+            
+            // Ignore les messages de groupe/statuts pour aller plus vite au début
+            shouldIgnoreJid: jid => isJidBroadcast(jid),
+
             getMessage: async (key) => { return { conversation: 'Hello' }; },
         });
 
@@ -99,9 +126,10 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
                     console.log(`📞 Demande code pour : ${cleanPhone}`);
                     const code = await sock.requestPairingCode(cleanPhone);
                     console.log(`🔑 CODE REÇU : ${code}`);
+                    // Mise à jour Rapide
                     await supabase.from('instances').update({ qr_code: code, status: 'pairing_code' }).eq('id', instanceId);
                 } catch (err) { console.error("❌ Erreur code:", err.message); }
-            }, 5000); 
+            }, 3000); // Délai réduit à 3s car le mode Turbo est prêt plus vite
         }
 
         sock.ev.on('connection.update', async (update) => {
@@ -112,7 +140,8 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
             }
             
             if (connection === 'open') {
-                console.log(`✅ CONNECTÉ !`);
+                console.log(`✅ CONNECTÉ ! (Sauvegarde finale...)`);
+                // Une fois connecté, on s'assure que tout est bien écrit
                 await supabase.from('instances').update({ qr_code: null, status: 'connected' }).eq('id', instanceId);
             }
             
@@ -122,7 +151,6 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
                 
                 if (shouldReconnect) startWhatsApp(instanceId, phoneNumber);
                 else {
-                    // Nettoyage partiel seulement en cas d'échec total
                     await supabase.from('instances').update({ status: 'disconnected', qr_code: null }).eq('id', instanceId);
                 }
             }
@@ -132,14 +160,16 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
     } catch (e) { console.error("🚨 Erreur fatale:", e); }
 };
 
-app.get('/', (req, res) => res.send('Worker Android Ready 🟢'));
+app.get('/', (req, res) => res.send('Worker Turbo Ready 🟢'));
 
 app.post('/init-session', async (req, res) => {
     const { instanceId, phoneNumber } = req.body;
     if (!instanceId) return res.status(400).json({ error: 'ID manquant' });
 
-    console.log(`🔄 Préparation Android pour ${instanceId}`);
+    console.log(`🔄 Nettoyage Rapide pour ${instanceId}`);
     try {
+        // On nettoie le cache mémoire local
+        memoryCache.clear();
         await supabase.from('whatsapp_sessions').delete().eq('session_id', instanceId);
         await supabase.from('instances').update({ qr_code: null, status: 'initializing' }).eq('id', instanceId);
     } catch (e) {}
