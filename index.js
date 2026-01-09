@@ -4,10 +4,14 @@ const express = require('express');
 const cors = require('cors');
 const pino = require('pino');
 
-// CONFIGURATION
+// --- CONFIGURATION ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 3000;
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.error("❌ ERREUR : Les variables SUPABASE_URL ou SUPABASE_KEY manquent !");
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app = express();
@@ -15,26 +19,51 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// GESTION AUTH SUPABASE
+// --- GESTION DE L'AUTHENTIFICATION SUPABASE ---
 const useSupabaseAuth = async (sessionId) => {
+    // Fonction pour écrire dans la DB
     const writeData = async (data, key) => {
-        const { error } = await supabase
-            .from('whatsapp_sessions')
-            .upsert({ session_id: sessionId, key_id: key, data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) });
+        try {
+            const { error } = await supabase
+                .from('whatsapp_sessions')
+                .upsert({ 
+                    session_id: sessionId, 
+                    key_id: key, 
+                    data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) 
+                });
+            if (error) console.error(`Erreur écriture (${key}):`, error.message);
+        } catch (e) {
+            console.error(`Erreur critique écriture (${key}):`, e);
+        }
     };
 
+    // Fonction pour lire depuis la DB
     const readData = async (key) => {
-        const { data } = await supabase
-            .from('whatsapp_sessions')
-            .select('data')
-            .eq('session_id', sessionId)
-            .eq('key_id', key)
-            .single();
-        return data?.data ? JSON.parse(JSON.stringify(data.data), BufferJSON.reviver) : null;
+        try {
+            const { data, error } = await supabase
+                .from('whatsapp_sessions')
+                .select('data')
+                .eq('session_id', sessionId)
+                .eq('key_id', key)
+                .single();
+            
+            if (error && error.code !== 'PGRST116') { // Ignorer erreur "non trouvé"
+                console.error(`Erreur lecture (${key}):`, error.message);
+                return null;
+            }
+            return data?.data ? JSON.parse(JSON.stringify(data.data), BufferJSON.reviver) : null;
+        } catch (e) {
+            console.error(`Erreur critique lecture (${key}):`, e);
+            return null;
+        }
     };
 
     const removeData = async (key) => {
-        await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId).eq('key_id', key);
+        try {
+            await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId).eq('key_id', key);
+        } catch (e) {
+            console.error(`Erreur suppression (${key}):`, e);
+        }
     };
 
     const creds = await readData('creds') || initAuthCreds();
@@ -71,9 +100,9 @@ const useSupabaseAuth = async (sessionId) => {
     };
 };
 
-// FONCTION PRINCIPALE
+// --- COEUR DU ROBOT WHATSAPP ---
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`🚀 Démarrage session ${instanceId} (Phone: ${phoneNumber || 'QR Mode'})`);
+    console.log(`🚀 Démarrage session : ${instanceId} (Mode: ${phoneNumber ? 'Code Tel' : 'QR Scan'})`);
     
     try {
         const { state, saveCreds } = await useSupabaseAuth(instanceId);
@@ -82,62 +111,79 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
         const sock = makeWASocket({
             version,
             auth: state,
-            logger: pino({ level: 'silent' }),
+            logger: pino({ level: 'silent' }), // Moins de bruit dans les logs
             printQRInTerminal: true,
-            // 👇 OPTIMISATION CRITIQUE POUR RENDER GRATUIT 👇
-            browser: ["Ubuntu", "Chrome", "20.0.04"], // Identité Linux stable
-            syncFullHistory: false,                   // ⚠️ INDISPENSABLE : Empêche le crash mémoire
-            generateHighQualityLinkPreview: false,    // Économise le CPU
-            connectTimeoutMs: 60000,                  // Laisse le temps au serveur
+            
+            // 👇 SECTION CRITIQUE POUR RENDER & WHATSAPP 👇
+            browser: ["Ubuntu", "Chrome", "20.0.04"], // ÉVITE L'ERREUR 401
+            syncFullHistory: false,                   // ÉVITE LE CRASH MÉMOIRE
+            generateHighQualityLinkPreview: false,    // ÉCONOMISE LE CPU
+            connectTimeoutMs: 60000,                  // ÉVITE LES TIMEOUTS TROP COURTS
+            // 👆 FIN SECTION CRITIQUE 👆
         });
 
-        // GESTION DU CODE DE JUMELAGE (PAIRING CODE)
+        // --- GESTION DU CODE DE JUMELAGE (PAIRING CODE) ---
         if (phoneNumber && !sock.authState.creds.registered) {
-            console.log("⏳ Attente avant demande du code...");
+            console.log("⏳ Attente 4s avant demande du code...");
+            
             setTimeout(async () => {
                 try {
-                    // Nettoyage du numéro
+                    // 1. Nettoyage strict du numéro (enlève + et espaces)
                     const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-                    console.log(`📞 Demande de code pour : ${cleanPhone}`);
+                    console.log(`📞 Demande envoyée pour : ${cleanPhone}`);
                     
+                    // 2. Demande du code à WhatsApp
                     const code = await sock.requestPairingCode(cleanPhone);
-                    console.log(`🔑 CODE REÇU : ${code}`);
+                    
+                    // 3. Affichage dans les logs (Copie-le d'ici si besoin !)
+                    console.log(`------------------------------------------------`);
+                    console.log(`🔑 TON CODE DE CONNEXION EST : ${code}`);
+                    console.log(`------------------------------------------------`);
 
-                    // Envoi direct dans Supabase
+                    // 4. Envoi dans Supabase pour le site
                     const { error } = await supabase
                         .from('instances')
                         .update({ qr_code: code, status: 'pairing_code' })
                         .eq('id', instanceId);
                     
-                    if(error) console.error("Erreur écriture Supabase:", error);
+                    if(error) console.error("❌ Erreur sauvegarde Supabase:", error.message);
+                    else console.log("✅ Code sauvegardé dans Supabase");
 
                 } catch (err) {
-                    console.error("❌ Erreur Pairing Code:", err.message);
+                    console.error("❌ ÉCHEC Pairing Code:", err.message || err);
                 }
-            }, 4000); // On attend 4s que la connexion soit prête
+            }, 4000); // Délai vital pour laisser la connexion s'établir
         }
 
+        // --- ÉVÉNEMENTS DE CONNEXION ---
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
-            // Si QR Code (seulement si pas de numéro demandé)
+            // Gestion du QR Code (Seulement si on n'a PAS demandé de code tel)
             if (qr && !phoneNumber) {
-                console.log("⚡ QR généré");
+                console.log("⚡ QR Code généré (Mode classique)");
                 await supabase.from('instances').update({ qr_code: qr, status: 'scanning' }).eq('id', instanceId);
             }
 
+            // Connexion RÉUSSIE
             if (connection === 'open') {
-                console.log(`✅ CONNECTÉ : ${instanceId}`);
+                console.log(`✅ SUCCÈS : ${instanceId} est connecté !`);
                 await supabase.from('instances').update({ qr_code: null, status: 'connected' }).eq('id', instanceId);
             }
 
+            // Connexion PERDUE ou FERMÉE
             if (connection === 'close') {
-                const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log(`❌ Déconnexion (${lastDisconnect.error?.output?.statusCode}). Reconnexion : ${shouldReconnect}`);
+                const statusCode = (lastDisconnect.error)?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                
+                console.log(`❌ Déconnexion (Code: ${statusCode}). Reconnexion auto : ${shouldReconnect}`);
                 
                 if (shouldReconnect) {
+                    // On relance
                     startWhatsApp(instanceId, phoneNumber);
                 } else {
+                    // C'est une déconnexion définitive (Logout)
+                    console.log("⚠️ Session fermée définitivement.");
                     await supabase.from('instances').update({ status: 'disconnected' }).eq('id', instanceId);
                 }
             }
@@ -146,24 +192,28 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
         sock.ev.on('creds.update', saveCreds);
         
     } catch (e) {
-        console.error("Erreur fatale startWhatsApp:", e);
+        console.error("🚨 Erreur fatale dans startWhatsApp:", e);
     }
 };
 
-// ROUTES
-app.get('/', (req, res) => res.send('Worker is Runnnig 🚀'));
+// --- ROUTES API ---
+app.get('/', (req, res) => res.send('WhatsApp Worker is Running 🟢'));
 
 app.post('/init-session', async (req, res) => {
     const { instanceId, phoneNumber } = req.body;
-    if (!instanceId) return res.status(400).json({ error: 'Missing instanceId' });
+    
+    if (!instanceId) {
+        return res.status(400).json({ error: 'Instance ID manquant' });
+    }
 
-    // On lance le processus en arrière-plan
-    startWhatsApp(instanceId, phoneNumber).catch(e => console.error(e));
+    // On lance le processus (sans attendre qu'il finisse pour ne pas bloquer le site)
+    startWhatsApp(instanceId, phoneNumber).catch(e => console.error("Erreur init:", e));
 
     return res.json({ 
         status: 'initializing', 
-        message: phoneNumber ? 'Code en cours...' : 'QR en cours...' 
+        message: phoneNumber ? 'Génération du code...' : 'Génération du QR...' 
     });
 });
 
-app.listen(PORT, () => console.log(`Serveur sur le port ${PORT}`));
+// Démarrage du serveur
+app.listen(PORT, () => console.log(`🚀 Serveur écoute sur le port ${PORT}`));
