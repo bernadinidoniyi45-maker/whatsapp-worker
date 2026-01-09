@@ -1,19 +1,18 @@
 {
   "name": "whatsapp-worker",
-  "version": "1.0.0",
-  "description": "Worker WhatsApp Baileys Supabase",
+  "version": "2.0.0",
+  "description": "Worker WhatsApp Baileys avec QR et Pairing Code",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
     "@hapi/boom": "^10.0.1",
     "@supabase/supabase-js": "^2.39.0",
-    "@whiskeysockets/baileys": "^6.5.0",
+    "@whiskeysockets/baileys": "^6.7.16",
+    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "pino": "^8.16.2",
-    "qrcode-terminal": "^0.12.0"
+    "pino": "^8.16.2"
   },
   "engines": {
     "node": ">=18.0.0"
