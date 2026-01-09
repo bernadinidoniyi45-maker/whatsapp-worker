@@ -109,12 +109,12 @@ const startWhatsApp = async (instanceId) => {
         auth: state,
         logger: pino({ level: 'silent' }),
         printQRInTerminal: true,
-        // 👇 LE CHANGEMENT EST ICI 👇
-        browser: ["Ubuntu", "Chrome", "20.0.04"], // On se fait passer pour Linux
+        // 👇 C'EST ICI QUE ÇA SE JOUE 👇
+        browser: ["Ubuntu", "Chrome", "20.0.04"], // 1. Identité stable (Linux)
+        syncFullHistory: false,                   // 2. ⚠️ INDISPENSABLE : Empêche le crash mémoire
         connectTimeoutMs: 60000,
-        syncFullHistory: false, // ⚠️ TRES IMPORTANT : Evite de surcharger le serveur au scan
-        markOnlineOnConnect: false,
     });
+
 
 
     activeSessions.set(instanceId, sock);
