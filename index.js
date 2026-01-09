@@ -4,14 +4,9 @@ const express = require('express');
 const cors = require('cors');
 const pino = require('pino');
 
-// --- CONFIGURATION ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 3000;
-
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error("❌ ERREUR : Les variables SUPABASE_URL ou SUPABASE_KEY manquent !");
-}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app = express();
@@ -19,45 +14,26 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- GESTION DE L'AUTHENTIFICATION SUPABASE ---
 const useSupabaseAuth = async (sessionId) => {
     const writeData = async (data, key) => {
         try {
-            const { error } = await supabase
-                .from('whatsapp_sessions')
-                .upsert({ 
-                    session_id: sessionId, 
-                    key_id: key, 
-                    data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) 
-                });
-            if (error) console.error(`Erreur écriture (${key}):`, error.message);
-        } catch (e) {
-            console.error(`Erreur critique écriture (${key}):`, e);
-        }
+            await supabase.from('whatsapp_sessions').upsert({ 
+                session_id: sessionId, 
+                key_id: key, 
+                data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)) 
+            });
+        } catch (e) { /* On ignore les petites erreurs d'écriture */ }
     };
 
     const readData = async (key) => {
         try {
-            const { data, error } = await supabase
-                .from('whatsapp_sessions')
-                .select('data')
-                .eq('session_id', sessionId)
-                .eq('key_id', key)
-                .single();
-            
-            if (error && error.code !== 'PGRST116') return null;
+            const { data } = await supabase.from('whatsapp_sessions').select('data').eq('session_id', sessionId).eq('key_id', key).single();
             return data?.data ? JSON.parse(JSON.stringify(data.data), BufferJSON.reviver) : null;
-        } catch (e) {
-            return null;
-        }
+        } catch (e) { return null; }
     };
 
     const removeData = async (key) => {
-        try {
-            await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId).eq('key_id', key);
-        } catch (e) {
-            console.error(`Erreur suppression (${key}):`, e);
-        }
+        await supabase.from('whatsapp_sessions').delete().eq('session_id', sessionId).eq('key_id', key);
     };
 
     const creds = await readData('creds') || initAuthCreds();
@@ -94,9 +70,8 @@ const useSupabaseAuth = async (sessionId) => {
     };
 };
 
-// --- COEUR DU ROBOT WHATSAPP ---
 const startWhatsApp = async (instanceId, phoneNumber = null) => {
-    console.log(`🚀 Démarrage session : ${instanceId} (Mode: ${phoneNumber ? 'Code Tel' : 'QR Scan'})`);
+    console.log(`🚀 Session: ${instanceId}`);
     
     try {
         const { state, saveCreds } = await useSupabaseAuth(instanceId);
@@ -107,63 +82,52 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
             auth: state,
             logger: pino({ level: 'silent' }),
             printQRInTerminal: true,
-            
-            // 👇 PROTECTION CRITIQUE 👇
-            browser: ["Ubuntu", "Chrome", "20.0.04"], // Anti-401
-            syncFullHistory: false,                   // Anti-Crash Render
-            generateHighQualityLinkPreview: false,
+            browser: ["Ubuntu", "Chrome", "20.0.04"], 
+            syncFullHistory: false,
+            generateHighQualityLinkPreview: false, // Économise le CPU
+            markOnlineOnConnect: false,            // Reste discret
             connectTimeoutMs: 60000,
+            // 👇 L'ASTUCE ANTI-CRASH EST ICI 👇
+            // On empêche le serveur de chercher de vieux messages qui font planter la mémoire
+            getMessage: async (key) => {
+                return { conversation: 'Hello' };
+            },
         });
 
-        // --- CODE DE JUMELAGE ---
         if (phoneNumber && !sock.authState.creds.registered) {
-            console.log("⏳ Attente 4s avant demande du code...");
-            
             setTimeout(async () => {
                 try {
                     const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-                    console.log(`📞 Demande envoyée pour : ${cleanPhone}`);
-                    
+                    console.log(`📞 Code pour : ${cleanPhone}`);
                     const code = await sock.requestPairingCode(cleanPhone);
-                    
-                    console.log(`------------------------------------------------`);
-                    console.log(`🔑 TON CODE : ${code}`);
-                    console.log(`------------------------------------------------`);
-
-                    await supabase.from('instances')
-                        .update({ qr_code: code, status: 'pairing_code' })
-                        .eq('id', instanceId);
-
-                } catch (err) {
-                    console.error("❌ ÉCHEC Pairing Code:", err.message);
-                }
-            }, 4000); 
+                    console.log(`🔑 CODE : ${code}`);
+                    await supabase.from('instances').update({ qr_code: code, status: 'pairing_code' }).eq('id', instanceId);
+                } catch (err) { console.error("Err Code:", err.message); }
+            }, 5000);
         }
 
-        // --- ÉVÉNEMENTS ---
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr && !phoneNumber) {
-                console.log("⚡ QR Code généré");
                 await supabase.from('instances').update({ qr_code: qr, status: 'scanning' }).eq('id', instanceId);
             }
 
             if (connection === 'open') {
-                console.log(`✅ CONNECTÉ : ${instanceId}`);
+                console.log(`✅ CONNECTÉ !`);
                 await supabase.from('instances').update({ qr_code: null, status: 'connected' }).eq('id', instanceId);
             }
 
             if (connection === 'close') {
-                const statusCode = (lastDisconnect.error)?.output?.statusCode;
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401; // On évite la boucle infinie sur 401
+                const code = (lastDisconnect.error)?.output?.statusCode;
+                // On ne reconnecte PAS si c'est une erreur 401 (Banni) ou 403 (Logout)
+                const shouldReconnect = code !== DisconnectReason.loggedOut && code !== 401 && code !== 403;
                 
-                console.log(`❌ Déconnexion (Code: ${statusCode}). Reconnexion : ${shouldReconnect}`);
+                console.log(`❌ Close (${code}). Retry: ${shouldReconnect}`);
                 
                 if (shouldReconnect) {
                     startWhatsApp(instanceId, phoneNumber);
                 } else {
-                    console.log("⚠️ Session fermée ou corrompue.");
                     await supabase.from('instances').update({ status: 'disconnected' }).eq('id', instanceId);
                 }
             }
@@ -171,43 +135,24 @@ const startWhatsApp = async (instanceId, phoneNumber = null) => {
 
         sock.ev.on('creds.update', saveCreds);
         
-    } catch (e) {
-        console.error("🚨 Erreur fatale startWhatsApp:", e);
-    }
+    } catch (e) { console.error("Fatal:", e); }
 };
 
-// --- ROUTES API ---
-app.get('/', (req, res) => res.send('WhatsApp Worker Ready 🟢'));
+app.get('/', (req, res) => res.send('Ready 🟢'));
 
 app.post('/init-session', async (req, res) => {
     const { instanceId, phoneNumber } = req.body;
-    
-    if (!instanceId) return res.status(400).json({ error: 'Instance ID manquant' });
+    if (!instanceId) return res.status(400).json({ error: 'ID manquant' });
 
-    console.log(`🔄 Nouvelle demande pour ${instanceId}. Nettoyage en cours...`);
-
-    // 👇 NETTOYAGE AUTOMATIQUE (Plus besoin de le faire à la main !) 👇
+    // Nettoyage Auto
     try {
-        // On supprime les anciennes sessions pour cet ID
         await supabase.from('whatsapp_sessions').delete().eq('session_id', instanceId);
-        // On remet la ligne instance à neuf
         await supabase.from('instances').delete().eq('id', instanceId); 
-        
-        // (Optionnel) Recréer la ligne instance propre tout de suite
-        await supabase.from('instances').insert([{ id: instanceId, status: 'initializing' }]);
-        
-        console.log("✨ Nettoyage terminé.");
-    } catch (e) {
-        console.error("Info nettoyage:", e.message); // Pas grave si ça échoue
-    }
+    } catch (e) {}
 
-    // On lance le processus
-    startWhatsApp(instanceId, phoneNumber).catch(e => console.error("Erreur init:", e));
-
-    return res.json({ 
-        status: 'initializing', 
-        message: 'Démarrage propre en cours...' 
-    });
+    startWhatsApp(instanceId, phoneNumber).catch(e => console.error(e));
+    return res.json({ status: 'initializing' });
 });
 
-app.listen(PORT, () => console.log(`🚀 Serveur sur port ${PORT}`));
+app.listen(PORT, () => console.log(`Port ${PORT}`));
+
